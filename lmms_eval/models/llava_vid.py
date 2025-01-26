@@ -1,7 +1,12 @@
 import copy
 import math
+import cv2
+
 from datetime import timedelta
 from typing import List, Optional, Tuple, Union
+
+
+import matplotlib.pyplot as plt
 
 import numpy as np
 import torch
@@ -121,6 +126,8 @@ class LlavaVid(lmms):
             overwrite_config["add_faster_video"] = False
             overwrite_config["delay_load"] = self.delay_load
             # overwrite_config["attn_implementation"] = attn_implementation
+            overwrite_config["attn_implementation"] = "eager"
+            overwrite_config["_attn_implementation"] = "eager"
 
             cfg_pretrained = AutoConfig.from_pretrained(self.pretrained)
 
@@ -137,6 +144,7 @@ class LlavaVid(lmms):
                     overwrite_config["tokenizer_model_max_length"] = 4096 * scaling_factor
 
             if "v1.5" in pretrained:  # A hardcode solution here to load v1.5 model, otherwise it will use LlavaConfig from hf transformers
+                import ipdb; ipdb.set_trace(context=20)
                 from llavavid.model.language_model.llava_llama import (
                     LlavaConfig,
                     LlavaLlamaForCausalLM,
@@ -367,7 +375,7 @@ class LlavaVid(lmms):
                         elif self.video_decode_backend == "pyav":
                             video = read_video_pyav(visual, num_frm=self.max_frames_num)
                         # video = self.load_video(visual, self.max_frames_num)
-                        video = self._image_processor.preprocess(video, return_tensors="pt")["pixel_values"].half().cuda()
+                        video = self._image_processor.preprocess(video, return_tensors="pt")["pixel_values"].to(torch.bfloat16).cuda()
                         videos.append(video)
                 except Exception as e:
                     eval_logger.info(f"{e}")
@@ -416,25 +424,124 @@ class LlavaVid(lmms):
                 gen_kwargs["top_p"] = None
             if "num_beams" not in gen_kwargs:
                 gen_kwargs["num_beams"] = 1
-            with torch.inference_mode():
-                output_ids = self.model.generate(
-                    inputs=input_ids,
-                    images=videos,
-                    attention_mask=attention_masks,
-                    modalities=["video" for _ in videos] if videos is not None else None,
-                    use_cache=self.use_cache,
-                    stopping_criteria=[stopping_criteria],
-                    do_sample=True if gen_kwargs["temperature"] > 0 else False,
-                    temperature=gen_kwargs["temperature"],
-                    top_p=gen_kwargs["top_p"],
-                    num_beams=gen_kwargs["num_beams"],
-                    max_new_tokens=gen_kwargs["max_new_tokens"],
-                )
+                
+            self.model.to(torch.bfloat16)
+            # with torch.inference_mode():
+            #     output_ids = self.model.generate(
+            #         inputs=input_ids,
+            #         images=videos,
+            #         attention_mask=attention_masks,
+            #         modalities=["video" for _ in videos] if videos is not None else None,
+            #         use_cache=self.use_cache,
+            #         stopping_criteria=[stopping_criteria],
+            #         do_sample=True if gen_kwargs["temperature"] > 0 else False,
+            #         temperature=gen_kwargs["temperature"],
+            #         top_p=gen_kwargs["top_p"],
+            #         num_beams=gen_kwargs["num_beams"],
+            #         max_new_tokens=gen_kwargs["max_new_tokens"],
+            #     )
                 # output_ids = model.generate(inputs=input_ids, images=video, attention_mask=attention_masks, modalities="video", do_sample=True, temperature=0.2, use_cache=True, stopping_criteria=[stopping_criteria])
-
-            outputs = self.tokenizer.batch_decode(output_ids, skip_special_tokens=True)[0].strip()
+            
+            # with torch.inference_mode():
+            outputs = self.model(
+                input_ids,
+                images=videos,
+                attention_mask=attention_masks,
+                modalities=["video" for _ in videos] if videos is not None else None,
+                output_attentions=True,
+            )
+            
+            eval_logger.info("Model input: {}", qs)
+            
+            # outputs = self.tokenizer.batch_decode(output_ids, skip_special_tokens=True)[0].strip()
+            # outputs = self.tokenizer.batch_decode(output_ids.sequences, skip_special_tokens=True)[0].strip()
             # inputs = self.tokenizer.batch_decode(input_ids % self.tokenizer.vocab_size, skip_special_tokens=True)[0].strip()
             # print(inputs, outputs)
+
+            attentions = outputs.attentions
+
+            # for attn_layer in attentions:
+            #     # attn_layer.requires_grad_(True)
+            #     attn_layer.retain_grad()
+            
+            attentions[0].retain_grad()
+            
+            prediction = outputs.logits
+            label_index = prediction.argmax(dim=-1)
+
+            prediction_score = prediction[..., label_index]
+            prediction_score.mean().backward()
+            
+            gradient = [attn_layer.grad for attn_layer in attentions]
+            modified_attention = []
+            
+            for attn_layer, grad_layer in zip(attentions, gradient):
+                if attn_layer is not None and grad_layer is not None:
+                    grad_weighted_attn = grad_layer * attn_layer
+                    
+                    grad_weighted_attn = grad_weighted_attn.mean(dim=1)
+                    modified_attention.append(grad_weighted_attn)
+            
+            import ipdb; ipdb.set_trace(context=20)
+            
+            # visualization
+            last_layer_attention = modified_attention[-1].squeeze(0)
+            # Find image token positions in the sequence
+            image_token_positions = torch.where(input_ids[0] == IMAGE_TOKEN_INDEX)[0].tolist()[0]
+            
+            num_frames = videos[0].shape[0]
+            frame_size = (videos[0].shape[2], videos[0].shape[3])
+            
+            image_token_length = 13 * 14 * num_frames
+            
+            # use the last token only
+            attn_image_tokens = last_layer_attention[image_token_positions: image_token_positions + image_token_length, -1].squeeze()
+            
+            # use the diagonal only
+            # attn_image_tokens = torch.diag(last_layer_attention[image_token_positions: image_token_positions + image_token_length, image_token_positions: image_token_positions + image_token_length])
+            
+            # normalize the attention
+            # attn_image_tokens = attn_image_tokens / attn_image_tokens.sum()
+            
+            # reshape to 2d
+            attn_image_tokens_2d = attn_image_tokens.view(num_frames, 13, 14)
+            
+            # remove the appended tokens
+            new_attn_image_tokens_2d = attn_image_tokens_2d[..., :13]
+                        
+            # show the frames and the attn            
+            normalized_frames = (videos[0] + 1) / 2  # Assuming original range is [-1,1]
+            
+            # normalize the attention per frame
+            for i in range(num_frames):
+                attn_min = new_attn_image_tokens_2d[i].min()
+                attn_max = new_attn_image_tokens_2d[i].max()
+                new_attn_image_tokens_2d[i] = (new_attn_image_tokens_2d[i] - attn_min) / (attn_max - attn_min)
+            
+            attn_normalized = new_attn_image_tokens_2d
+            
+            print(attn_normalized.max(), attn_normalized.min())
+            
+            # attn_min = new_attn_image_tokens_2d.min()
+            # attn_max = new_attn_image_tokens_2d.max()
+            # attn_normalized = (new_attn_image_tokens_2d - attn_min) / (attn_max - attn_min)
+            
+            # resize the attention to the frame size
+            attn_normalized = torch.nn.functional.interpolate(attn_normalized.unsqueeze(0), size=frame_size, mode='bilinear').squeeze(0)
+            
+            fig, ax = plt.subplots(1, num_frames, figsize=(20, 5 * num_frames))
+            for i in range(num_frames):
+                ax[i].imshow(normalized_frames[i].permute(1,2,0).to(torch.float32).cpu().numpy())
+                ax[i].imshow(attn_normalized[i].detach().to(torch.float32).cpu().numpy(), alpha=0.3, cmap='jet')
+                ax[i].set_title(f'Frame {i}')
+                ax[i].axis('off')
+            
+            plt.tight_layout()
+            plt.savefig('debug.png', bbox_inches='tight')
+            
+            raise NotImplementedError("Debugging")
+            
             res.append(outputs)
             pbar.update(1)
         return res
+    
