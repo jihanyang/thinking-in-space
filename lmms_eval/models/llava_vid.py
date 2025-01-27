@@ -443,8 +443,15 @@ class LlavaVid(lmms):
                 # output_ids = model.generate(inputs=input_ids, images=video, attention_mask=attention_masks, modalities="video", do_sample=True, temperature=0.2, use_cache=True, stopping_criteria=[stopping_criteria])
             
             self.model.model.vision_tower.requires_grad_(False)
+            self.model.train()
+            self.model.gradient_checkpointing_enable()
+            self.model.requires_grad_(False)
+            self.model.lm_head.requires_grad_(True)
+            self.model.model.norm.requires_grad_(True)
+            self.model.model.layers[-1].requires_grad_(True)
             
             # with torch.inference_mode():
+            # with torch.autocast("cuda", dtype=torch.bfloat16):
             outputs = self.model(
                 input_ids,
                 images=videos,
@@ -460,31 +467,32 @@ class LlavaVid(lmms):
 
             attentions = outputs.attentions
             
-            for i, attn_layer in enumerate(attentions):
-                if i < len(attentions) - 1:
-                    attn_layer.requires_grad_(False)
-                else:
-                    attn_layer.requires_grad_(True)
-                    attn_layer.retain_grad()
+            # for i, attn_layer in enumerate(attentions):
+            #     if i < len(attentions) - 1:
+            #         attn_layer.requires_grad_(False)
+            #     else:
+            #         attn_layer.requires_grad_(True)
+            #         attn_layer.retain_grad()
             
-            # attentions[-1].retain_grad()
+            attentions[-1].retain_grad()
             
             prediction = outputs.logits
             label_index = prediction.argmax(dim=-1)
 
             prediction_score = prediction[..., label_index]
-            import ipdb; ipdb.set_trace(context=20)
             
+            # torch.autograd.grad(prediction_score.mean(), attentions[0])
             prediction_score.mean().backward()
             
-            gradient = [attn_layer.grad for attn_layer in attentions]
+            gradient = [attn_layer.grad.detach().cpu() for attn_layer in attentions]
             modified_attention = []
             
             for attn_layer, grad_layer in zip(attentions, gradient):
                 if attn_layer is not None and grad_layer is not None:
-                    grad_weighted_attn = grad_layer * attn_layer
+                    grad_weighted_attn = grad_layer * attn_layer.detach().cpu()
                     
-                    grad_weighted_attn = grad_weighted_attn.mean(dim=1)
+                    # grad_weighted_attn = grad_weighted_attn.mean(dim=1)
+                    grad_weighted_attn = grad_weighted_attn.max(dim=1)[0]
                     modified_attention.append(grad_weighted_attn)
             
             # visualization
@@ -499,9 +507,10 @@ class LlavaVid(lmms):
             
             # use the last token only
             # attn_image_tokens = last_layer_attention[image_token_positions: image_token_positions + image_token_length, -1].squeeze()
+            attn_image_tokens = last_layer_attention[-1, image_token_positions: image_token_positions + image_token_length].squeeze()
             
             # use the diagonal only
-            attn_image_tokens = torch.diag(last_layer_attention[image_token_positions: image_token_positions + image_token_length, image_token_positions: image_token_positions + image_token_length])
+            # attn_image_tokens = torch.diag(last_layer_attention[image_token_positions: image_token_positions + image_token_length, image_token_positions: image_token_positions + image_token_length])
             
             # normalize the attention
             # attn_image_tokens = attn_image_tokens / attn_image_tokens.sum()
@@ -540,10 +549,21 @@ class LlavaVid(lmms):
             fig.text(0.5, 0.95, self.task_dict[task][split][doc_id]['question'], ha='left', fontsize=13)  # x=0.5 (center), y=0.95 (near top)
 
             plt.tight_layout()
-            plt.savefig(f'./llava-video-7b-8frame-last-layer-diag-attn/{self.task_dict[task][split][doc_id]["id"]}.png', bbox_inches='tight')
+            plt.savefig(f'./llava-video-7b-32frame-last-layer-diag-attn/{self.task_dict[task][split][doc_id]["id"]}.png', bbox_inches='tight')
             
+            for param in self.model.parameters():
+                if param.grad is not None:
+                    del param.grad
+                    param.grad = None   
+            del attentions[0].grad
+            del attentions; attentions = None
+            del outputs; outputs = None
+            del videos; videos = None
+            del input_ids; input_ids = None
+            del attention_masks; attention_masks = None
+
             torch.cuda.empty_cache()
-            
+
             res.append(outputs)
             pbar.update(1)
         return res
