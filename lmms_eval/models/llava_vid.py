@@ -442,6 +442,8 @@ class LlavaVid(lmms):
             #     )
                 # output_ids = model.generate(inputs=input_ids, images=video, attention_mask=attention_masks, modalities="video", do_sample=True, temperature=0.2, use_cache=True, stopping_criteria=[stopping_criteria])
             
+            self.model.model.vision_tower.requires_grad_(False)
+            
             # with torch.inference_mode():
             outputs = self.model(
                 input_ids,
@@ -451,25 +453,28 @@ class LlavaVid(lmms):
                 output_attentions=True,
             )
             
-            eval_logger.info("Model input: {}", qs)
-            
             # outputs = self.tokenizer.batch_decode(output_ids, skip_special_tokens=True)[0].strip()
             # outputs = self.tokenizer.batch_decode(output_ids.sequences, skip_special_tokens=True)[0].strip()
             # inputs = self.tokenizer.batch_decode(input_ids % self.tokenizer.vocab_size, skip_special_tokens=True)[0].strip()
             # print(inputs, outputs)
 
             attentions = outputs.attentions
-
-            # for attn_layer in attentions:
-            #     # attn_layer.requires_grad_(True)
-            #     attn_layer.retain_grad()
             
-            attentions[0].retain_grad()
+            for i, attn_layer in enumerate(attentions):
+                if i < len(attentions) - 1:
+                    attn_layer.requires_grad_(False)
+                else:
+                    attn_layer.requires_grad_(True)
+                    attn_layer.retain_grad()
+            
+            # attentions[-1].retain_grad()
             
             prediction = outputs.logits
             label_index = prediction.argmax(dim=-1)
 
             prediction_score = prediction[..., label_index]
+            import ipdb; ipdb.set_trace(context=20)
+            
             prediction_score.mean().backward()
             
             gradient = [attn_layer.grad for attn_layer in attentions]
@@ -482,8 +487,6 @@ class LlavaVid(lmms):
                     grad_weighted_attn = grad_weighted_attn.mean(dim=1)
                     modified_attention.append(grad_weighted_attn)
             
-            import ipdb; ipdb.set_trace(context=20)
-            
             # visualization
             last_layer_attention = modified_attention[-1].squeeze(0)
             # Find image token positions in the sequence
@@ -495,10 +498,10 @@ class LlavaVid(lmms):
             image_token_length = 13 * 14 * num_frames
             
             # use the last token only
-            attn_image_tokens = last_layer_attention[image_token_positions: image_token_positions + image_token_length, -1].squeeze()
+            # attn_image_tokens = last_layer_attention[image_token_positions: image_token_positions + image_token_length, -1].squeeze()
             
             # use the diagonal only
-            # attn_image_tokens = torch.diag(last_layer_attention[image_token_positions: image_token_positions + image_token_length, image_token_positions: image_token_positions + image_token_length])
+            attn_image_tokens = torch.diag(last_layer_attention[image_token_positions: image_token_positions + image_token_length, image_token_positions: image_token_positions + image_token_length])
             
             # normalize the attention
             # attn_image_tokens = attn_image_tokens / attn_image_tokens.sum()
@@ -513,33 +516,33 @@ class LlavaVid(lmms):
             normalized_frames = (videos[0] + 1) / 2  # Assuming original range is [-1,1]
             
             # normalize the attention per frame
-            for i in range(num_frames):
-                attn_min = new_attn_image_tokens_2d[i].min()
-                attn_max = new_attn_image_tokens_2d[i].max()
-                new_attn_image_tokens_2d[i] = (new_attn_image_tokens_2d[i] - attn_min) / (attn_max - attn_min)
+            # for i in range(num_frames):
+            #     attn_min = new_attn_image_tokens_2d[i].min()
+            #     attn_max = new_attn_image_tokens_2d[i].max()
+            #     new_attn_image_tokens_2d[i] = (new_attn_image_tokens_2d[i] - attn_min) / (attn_max - attn_min)
             
-            attn_normalized = new_attn_image_tokens_2d
+            # attn_normalized = new_attn_image_tokens_2d
             
-            print(attn_normalized.max(), attn_normalized.min())
-            
-            # attn_min = new_attn_image_tokens_2d.min()
-            # attn_max = new_attn_image_tokens_2d.max()
-            # attn_normalized = (new_attn_image_tokens_2d - attn_min) / (attn_max - attn_min)
+            attn_min = new_attn_image_tokens_2d.min()
+            attn_max = new_attn_image_tokens_2d.max()
+            attn_normalized = (new_attn_image_tokens_2d - attn_min) / (attn_max - attn_min)    
             
             # resize the attention to the frame size
             attn_normalized = torch.nn.functional.interpolate(attn_normalized.unsqueeze(0), size=frame_size, mode='bilinear').squeeze(0)
             
-            fig, ax = plt.subplots(1, num_frames, figsize=(20, 5 * num_frames))
+            fig, ax = plt.subplots(1, num_frames, figsize=(5 * num_frames, 7))
             for i in range(num_frames):
                 ax[i].imshow(normalized_frames[i].permute(1,2,0).to(torch.float32).cpu().numpy())
                 ax[i].imshow(attn_normalized[i].detach().to(torch.float32).cpu().numpy(), alpha=0.3, cmap='jet')
                 ax[i].set_title(f'Frame {i}')
                 ax[i].axis('off')
             
+            fig.text(0.5, 0.95, self.task_dict[task][split][doc_id]['question'], ha='left', fontsize=13)  # x=0.5 (center), y=0.95 (near top)
+
             plt.tight_layout()
-            plt.savefig('debug.png', bbox_inches='tight')
+            plt.savefig(f'./llava-video-7b-8frame-last-layer-diag-attn/{self.task_dict[task][split][doc_id]["id"]}.png', bbox_inches='tight')
             
-            raise NotImplementedError("Debugging")
+            torch.cuda.empty_cache()
             
             res.append(outputs)
             pbar.update(1)
